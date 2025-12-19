@@ -1,0 +1,5 @@
+buildings: 32
+height_min: 10.557
+height_max: 30.108
+height_mean: 21.485
+circle_radius: 584.475
