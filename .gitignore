@@ -2,3 +2,9 @@ write_task.md
 .venv/
 __pycache__/
 综述/
+find/
+output/演示文稿1.pptx
+find/.gemini/
+.gemini/.env
+.gemini/settings.json
+.gitignore

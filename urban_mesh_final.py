@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm, colors as mcolors
 from matplotlib.patches import Circle
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 
 # 配置matplotlib支持中文显示
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "WenQuanYi Micro Hei", "Arial Unicode MS"]
@@ -76,17 +76,164 @@ DEFAULT_CONFIG = {
     "view_roll": 0,
     "view_margin_ratio": 0.5,
     "ground_radius_ratio": 1.05,
-    "ground_color": "#D5CCBF",
+    "ground_color": "#F8F8F8", # 更浅的地面
     "dpi": 300,
     "figsize": (12, 12),
     "axis_off": True,
-    "use_height_color": False,
-    "building_color": "#B0B0B0",
-    "edge_color": "black",
-    "edge_alpha": 0.3,
+    "use_height_color": False, # 关闭高度着色，使用统一的高对比度颜色
+    "building_color": "#D0D0D0", # 调亮建筑颜色以便看清喵～
+    "edge_color": "#101010",
+    "edge_alpha": 1.0, # 加深轮廓
     "write_stats": True,
     "building_size": (26.0, 30.0),
+    "show_grid": True,
+    "grid_lines": 50,        # 增加总线数，配合新的密度分布，确保整体视觉效果饱满
+    "grid_levels": 5,        
+    "grid_sigma_ratio": 0.11,
 }
+
+
+def calculate_adaptive_grid_3d(positions, radius, heights, config):
+    """
+    优化后的密度映射：普通区域均匀，扎堆区域显著加密喵～
+    """
+    num_lines = config["grid_lines"]
+    num_levels = config["grid_levels"]
+    sigma = radius * config["grid_sigma_ratio"] * 1.1
+    
+    samples = np.linspace(-radius, radius, 500)
+    dens_x = np.zeros_like(samples)
+    dens_y = np.zeros_like(samples)
+    
+    if len(positions) > 0:
+        for px, py in positions:
+            dens_x += np.exp(-((samples - px)**2) / (2 * sigma**2))
+            dens_y += np.exp(-((samples - py)**2) / (2 * sigma**2))
+    
+    # --- 陡峭加密增强喵 (优化版) ---
+    # 1. 归一化并取 1.5 次幂，降低陡峭度，让过渡更平滑
+    power_val = 1.5
+    if np.max(dens_x) > 0:
+        dens_x = (dens_x / np.max(dens_x))**power_val
+    if np.max(dens_y) > 0:
+        dens_y = (dens_y / np.max(dens_y))**power_val
+    
+    # 2. 提高基础密度，避免非建筑区过于稀疏（从 0.1 提升到 0.2）
+    # 这样网格分布会更均匀，不会出现极度稀疏的"丑"区域喵～
+    base_density = 0.15
+    dens_x += base_density
+    dens_y += base_density
+    
+    # 计算 CDF
+    cdf_x = np.cumsum(dens_x)
+    cdf_x = (cdf_x - cdf_x[0]) / (cdf_x[-1] - cdf_x[0])
+    cdf_y = np.cumsum(dens_y)
+    cdf_y = (cdf_y - cdf_y[0]) / (cdf_y[-1] - cdf_y[0])
+    
+    grid_x = np.interp(np.linspace(0, 1, num_lines), cdf_x, samples)
+    grid_y = np.interp(np.linspace(0, 1, num_lines), cdf_y, samples)
+    
+    # Z 方向保持平方分布
+    max_h = np.max(heights) if len(heights) > 0 else config["h_max"]
+    z_limit = max_h * 1.5
+    grid_z = z_limit * (np.linspace(0, 1, num_levels)**1.5)
+    
+    return grid_x, grid_y, grid_z, sigma
+
+
+def draw_adaptive_grid_3d(ax, grid_x, grid_y, grid_z, positions, sigma, radius, buildings_data=None, heights=None):
+    """
+    绘制 3D 结构化自适应网格，并增加建筑遮挡剔除逻辑喵～
+    """
+    try:
+        cmap = plt.get_cmap("RdBu_r")
+    except:
+        cmap = cm.get_cmap("RdBu_r")
+    
+    def get_local_density(x, y):
+        if len(positions) == 0: return 0
+        d = 0
+        for px, py in positions:
+            dist_sq = (x - px)**2 + (y - py)**2
+            d += np.exp(-dist_sq / (2 * sigma**2))
+        return d
+
+    def is_inside_any_building(x, y, z):
+        if buildings_data is None: return False
+        margin = 6.0 # 增大遮挡剔除的边距，让建筑周围更清爽喵～ (3.0 -> 6.0)
+        for i, b in enumerate(buildings_data):
+            bx, by = b["center"]
+            bw, bd = b["size"]
+            bh = heights[i] if heights is not None else 100
+            if (bx - (bw + margin)/2 <= x <= bx + (bw + margin)/2) and \
+               (by - (bd + margin)/2 <= y <= by + (bd + margin)/2) and \
+               (0 <= z <= bh + 0.5):
+                return True
+        return False
+
+    density_samples = [get_local_density(px, py) for px, py in positions] if len(positions) > 0 else [1.0]
+    max_d = np.max(density_samples) if density_samples else 1.0
+    
+    line_segments = []
+    line_colors = []
+
+    # 1. 绘制水平面网格线
+    for z in grid_z:
+        for x in grid_x:
+            y_min, y_max = -np.sqrt(max(0, radius**2 - x**2)), np.sqrt(max(0, radius**2 - x**2))
+            if y_max <= y_min: continue
+            
+            y_steps = np.linspace(y_min, y_max, 60)
+            for i in range(len(y_steps)-1):
+                y1, y2 = y_steps[i], y_steps[i+1]
+                mid_y = (y1 + y2) / 2
+                # 建筑遮挡检查
+                if is_inside_any_building(x, mid_y, z): continue
+                
+                d = get_local_density(x, mid_y)
+                # --- 高对比度颜色增强喵 (适配优化版) ---
+                color_val = np.clip((d / max_d)**1.5 * 1.2, 0.0, 1.0)
+                line_segments.append([(x, y1, z), (x, y2, z)])
+                line_colors.append(cmap(color_val))
+
+        for y in grid_y:
+            x_min, x_max = -np.sqrt(max(0, radius**2 - y**2)), np.sqrt(max(0, radius**2 - y**2))
+            if x_max <= x_min: continue
+            
+            x_steps = np.linspace(x_min, x_max, 60)
+            for i in range(len(x_steps)-1):
+                x1, x2 = x_steps[i], x_steps[i+1]
+                mid_x = (x1 + x2) / 2
+                if is_inside_any_building(mid_x, y, z): continue
+                
+                d = get_local_density(mid_x, y)
+                # --- 高对比度颜色增强喵 (适配优化版) ---
+                color_val = np.clip((d / max_d)**1.5 * 1.2, 0.0, 1.0)
+                line_segments.append([(x1, y, z), (x2, y, z)])
+                line_colors.append(cmap(color_val))
+
+    # 2. 绘制垂直线
+    # 稍微增加采样率，但网格已经稀疏了，所以不会乱
+    for x in grid_x:
+        for y in grid_y:
+            if np.hypot(x, y) > radius: continue
+            
+            z_steps = np.linspace(grid_z[0], grid_z[-1], 20)
+            d = get_local_density(x, y)
+            # 增加颜色饱和度映射 (适配优化版)
+            color_val = np.clip((d / max_d)**1.5 * 1.2, 0.0, 1.0)
+            color = cmap(color_val)
+            for i in range(len(z_steps)-1):
+                z1, z2 = z_steps[i], z_steps[i+1]
+                if is_inside_any_building(x, y, (z1+z2)/2): continue
+                line_segments.append([(x, y, z1), (x, y, z2)])
+                line_colors.append(color)
+
+    # 显著增强线宽和不透明度
+    # 降低网格透明度，突出建筑喵～ (进一步弱化网格：lw 0.6->0.3, alpha 0.25->0.15)
+    grid_collection = Line3DCollection(line_segments, colors=line_colors, linewidths=0.3, alpha=0.3)
+    grid_collection.set_zorder(0)
+    ax.add_collection3d(grid_collection)
 
 
 def _ginput_one(fig, ax, title):
@@ -296,7 +443,7 @@ def draw_building_with_shading(
         edge_rgba = _resolve_color(edge_color, default="black")
         edge_rgba[3] = float(edge_alpha)
         edgecolors = edge_rgba
-        linewidths = 0.3
+        linewidths = 1.2 # 增加线宽，让轮廓更锐利 (0.8 -> 1.2)
     else:
         edgecolors = "none"
         linewidths = 0.0
@@ -307,8 +454,10 @@ def draw_building_with_shading(
         edgecolors=edgecolors,
         linewidths=linewidths,
     )
+    # 提高建筑的 Z 排序优先级，确保它们在网格之上
+    poly.set_zorder(10)
     if sort_zpos is not None and hasattr(poly, "set_sort_zpos"):
-        poly.set_sort_zpos(float(sort_zpos))
+        poly.set_sort_zpos(float(sort_zpos) + 1000)
     ax.add_collection3d(poly)
 
 
@@ -376,6 +525,18 @@ def build_model(config, buildings=None, circle_radius=None, circle_center=None):
 
     ground_radius = circle_radius * float(config["ground_radius_ratio"])
     draw_ground_circle(ax, center=circle_center, radius=ground_radius, color=config["ground_color"])
+
+    # --- 新增：绘制 3D 结构化自适应网格喵 ---
+    if config.get("show_grid", True):
+        print("正在生成 3D 结构化自适应网格喵...")
+        grid_x, grid_y, grid_z, sigma = calculate_adaptive_grid_3d(
+            positions, 
+            ground_radius, 
+            heights,
+            config
+        )
+        draw_adaptive_grid_3d(ax, grid_x, grid_y, grid_z, positions, sigma, ground_radius, 
+                              buildings_data=buildings, heights=heights)
 
     for i, building in enumerate(buildings):
         cx, cy = building["center"]
